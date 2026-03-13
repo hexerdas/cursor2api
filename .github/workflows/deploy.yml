@@ -1,0 +1,5 @@
+  # .github/workflows/deploy.yml
+  - name: Build and push
+    run: |
+      docker build -t ghcr.io/${{ github.repository }}:latest .
+      docker push ghcr.io/${{ github.repository }}:latest
