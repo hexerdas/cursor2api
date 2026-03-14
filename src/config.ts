@@ -80,6 +80,7 @@ export function getConfig(): AppConfig {
     if (process.env.TIMEOUT) config.timeout = parseInt(process.env.TIMEOUT);
     if (process.env.PROXY) config.proxy = process.env.PROXY;
     if (process.env.CURSOR_MODEL) config.cursorModel = process.env.CURSOR_MODEL;
+    if (process.env.FORCE_USE_CURSOR_MODEL !== undefined) config.forceUseCursorModel = process.env.FORCE_USE_CURSOR_MODEL !== 'false';
     if (process.env.ENABLE_THINKING !== undefined) config.enableThinking = process.env.ENABLE_THINKING !== 'false';
 
     // 从 base64 FP 环境变量解析指纹

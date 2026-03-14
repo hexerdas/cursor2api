@@ -690,233 +690,332 @@ function writeResponsesSSE(res: Response, event: string, data: Record<string, un
  * 必须以 response.completed 事件结束，否则客户端报
  * "stream disconnected before completion: stream closed before response.completed"
  */
-export async function handleOpenAIResponses(req: Request, res: Response): Promise<void> {
-    const body = req.body;
-    const isStream = (body.stream as boolean) ?? true;
-    console.log(`[OpenAI] 收到 /v1/responses 请求: model=${body.model}, stream=${isStream}`);
+  export async function handleOpenAIResponses(req: Request, res: Response): Promise<void> {
+      const body = req.body;
+      const isStream = (body.stream as boolean) ?? true;
+      console.log(`[OpenAI] 收到 /v1/responses 请求: model=${body.model}, stream=${isStream}`);
 
-    if (!isStream) {
-        // 非流式：转换为 Chat Completions 后走原有管道，返回 JSON
-        try {
-            const chatBody = responsesToChatCompletions(body);
-            req.body = chatBody;
-            return handleOpenAIChatCompletions(req, res);
-        } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : String(err);
-            console.error(`[OpenAI] /v1/responses 非流式处理失败:`, message);
-            res.status(500).json({ error: { message, type: 'server_error', code: 'internal_error' } });
-        }
-        return;
-    }
+      if (!isStream) {
+          // 非流式：构建 Responses API 格式 JSON（不能复用 Chat Completions 格式）
+          try {
+              const chatBody = responsesToChatCompletions(body);
+              const anthropicReq = convertToAnthropicRequest(chatBody);
+              const cursorReq = await convertToCursorRequest(anthropicReq);
+              const responseId = 'resp_' + uuidv4().replace(/-/g, '').substring(0, 24);
+              const model = (body.model as string) || 'gpt-4o';
+              const created = Math.floor(Date.now() / 1000);
 
-    // 流式：必须发出 Responses API 专用 SSE 事件序列
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no',
-    });
+              let fullResponse = '';
+              await sendCursorRequest(cursorReq, (event: CursorSSEEvent) => {
+                  if (event.type === 'text-delta' && event.delta) fullResponse += event.delta;
+              });
 
-    const responseId = 'resp_' + uuidv4().replace(/-/g, '').substring(0, 24);
-    const itemId = 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
-    const model = (body.model as string) || 'gpt-4o';
-    const created = Math.floor(Date.now() / 1000);
+              const usageEst = estimateInputTokens(anthropicReq);
+              const outputTokens = Math.ceil(fullResponse.length / 3);
+              const hasTools = (chatBody.tools?.length ?? 0) > 0;
+              const outputItems: Record<string, unknown>[] = [];
 
-    try {
-        // Convert Responses API request to internal Anthropic format
-        const chatBody = responsesToChatCompletions(body);
-        const anthropicReq = convertToAnthropicRequest(chatBody);
-        const cursorReq = await convertToCursorRequest(anthropicReq);
+              // reasoning item if thinking content present
+              const { thinkingBlocks: tb0, cleanText: textAfterThinking0 } = extractThinking(fullResponse);
+              const thinking0 = tb0.map(b => b.thinking).join('\n\n');
+              if (thinking0) {
+                  outputItems.push({
+                      id: 'rs_' + uuidv4().replace(/-/g, '').substring(0, 24),
+                      type: 'reasoning',
+                      summary: [{ type: 'summary_text', text: thinking0 }],
+                      status: 'completed',
+                  });
+              }
+              const responseText0 = thinking0 ? textAfterThinking0 : fullResponse;
 
-        // response.created
-        writeResponsesSSE(res, 'response.created', {
-            type: 'response.created',
-            response: { id: responseId, object: 'realtime.response', model, status: 'in_progress', created_at: created, output: [] },
-        });
+              if (hasTools && hasToolCalls(responseText0)) {
+                  const { toolCalls, cleanText } = parseToolCalls(responseText0);
+                  const cleanOutput = sanitizeResponse(isRefusal(cleanText) ? '' : cleanText);
+                  if (cleanOutput) {
+                      outputItems.push({
+                          id: 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24),
+                          type: 'message', role: 'assistant',
+                          content: [{ type: 'output_text', text: cleanOutput }],
+                          status: 'completed',
+                      });
+                  }
+                  for (const tc of toolCalls) {
+                      const callId = 'call_' + uuidv4().replace(/-/g, '').substring(0, 24);
+                      outputItems.push({
+                          id: callId, type: 'function_call', call_id: callId,
+                          name: tc.name, arguments: JSON.stringify(tc.arguments),
+                          status: 'completed',
+                      });
+                  }
+              } else {
+                  const sanitized = sanitizeResponse(responseText0);
+                  outputItems.push({
+                      id: 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24),
 
-        // response.in_progress
-        writeResponsesSSE(res, 'response.in_progress', {
-            type: 'response.in_progress',
-            response: { id: responseId, object: 'realtime.response', model, status: 'in_progress', created_at: created, output: [] },
-        });
+                      type: 'message', role: 'assistant',
+                      content: [{ type: 'output_text', text: sanitized }],
+                      status: 'completed',
+                  });
+              }
 
-        // Collect full response
-        let fullResponse = '';
-        await sendCursorRequest(cursorReq, (event: CursorSSEEvent) => {
-            if (event.type === 'text-delta' && event.delta) fullResponse += event.delta;
-        });
+              res.json({
+                  id: responseId,
+                  object: 'response',
+                  model,
+                  status: 'completed',
+                  created_at: created,
+                  output: outputItems,
+                  usage: {
+                      input_tokens: usageEst.input_tokens,
+                      output_tokens: outputTokens,
+                      total_tokens: usageEst.input_tokens + outputTokens,
+                  },
+              });
+          } catch (err: unknown) {
+              const message = err instanceof Error ? err.message : String(err);
+              console.error(`[OpenAI] /v1/responses 非流式处理失败:`, message);
+              res.status(500).json({ error: { message, type: 'server_error', code: 'internal_error' } });      
+          }
+          return;
+      }
 
-        const hasTools = (chatBody.tools?.length ?? 0) > 0;
-        const outputItems: Record<string, unknown>[] = [];
+      // 流式：必须发出 Responses API 专用 SSE 事件序列
+      res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+      });
 
-        if (hasTools && hasToolCalls(fullResponse)) {
-            const { toolCalls, cleanText } = parseToolCalls(fullResponse);
+      const responseId = 'resp_' + uuidv4().replace(/-/g, '').substring(0, 24);
+      const itemId = 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
+      const model = (body.model as string) || 'gpt-4o';
+      const created = Math.floor(Date.now() / 1000);
 
-            // Text part (if any)
-            const cleanOutput = sanitizeResponse(isRefusal(cleanText) ? '' : cleanText);
-            if (cleanOutput) {
-                const textItemId = 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
-                const textItem = { id: textItemId, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: cleanOutput }], status: 'completed' };
-                writeResponsesSSE(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputItems.length, item: textItem });
-                writeResponsesSSE(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: textItemId, output_index: outputItems.length, content_index: 0, delta: cleanOutput });
-                writeResponsesSSE(res, 'response.output_text.done', { type: 'response.output_text.done', item_id: textItemId, output_index: outputItems.length, content_index: 0, text: cleanOutput });
-                writeResponsesSSE(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputItems.length, item: textItem });
-                outputItems.push(textItem);
-            }
+      try {
+          const chatBody = responsesToChatCompletions(body);
+          const anthropicReq = convertToAnthropicRequest(chatBody);
+          const cursorReq = await convertToCursorRequest(anthropicReq);
 
-            // Tool calls
-            for (const tc of toolCalls) {
-                const callId = 'call_' + uuidv4().replace(/-/g, '').substring(0, 24);
-                const argsStr = JSON.stringify(tc.arguments);
-                const fnItem = { id: callId, type: 'function_call', call_id: callId, name: tc.name, arguments: argsStr, status: 'completed' };
-                const outputIndex = outputItems.length;
-                writeResponsesSSE(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...fnItem, arguments: '' } });
-                writeResponsesSSE(res, 'response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: callId, output_index: outputIndex, call_id: callId, delta: argsStr });
-                writeResponsesSSE(res, 'response.function_call_arguments.done', { type: 'response.function_call_arguments.done', item_id: callId, output_index: outputIndex, call_id: callId, arguments: argsStr });
-                writeResponsesSSE(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: fnItem });
-                outputItems.push(fnItem);
-            }
-        } else {
-            // Plain text response
-            const sanitized = sanitizeResponse(fullResponse);
-            const textItem = { id: itemId, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: sanitized }], status: 'completed' };
-            writeResponsesSSE(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: 0, item: { ...textItem, content: [{ type: 'output_text', text: '' }] } });
-            // Stream text deltas
-            const CHUNK = 64;
-            for (let i = 0; i < sanitized.length; i += CHUNK) {
-                writeResponsesSSE(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: itemId, output_index: 0, content_index: 0, delta: sanitized.slice(i, i + CHUNK) });
-            }
-            writeResponsesSSE(res, 'response.output_text.done', { type: 'response.output_text.done', item_id: itemId, output_index: 0, content_index: 0, text: sanitized });
-            writeResponsesSSE(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: 0, item: textItem });
-            outputItems.push(textItem);
-        }
+          writeResponsesSSE(res, 'response.created', {
+              type: 'response.created',
+              response: { id: responseId, object: 'response', model, status: 'in_progress', created_at:        
+  created, output: [] },
+          });
+          writeResponsesSSE(res, 'response.in_progress', {
+              type: 'response.in_progress',
+              response: { id: responseId, object: 'response', model, status: 'in_progress', created_at:        
+  created, output: [] },
+          });
 
-        // response.completed — this is what Codex waits for
-        writeResponsesSSE(res, 'response.completed', {
-            type: 'response.completed',
-            response: {
-                id: responseId,
-                object: 'realtime.response',
-                model,
-                status: 'completed',
-                created_at: created,
-                output: outputItems,
-                usage: {
-                    input_tokens: estimateInputTokens(anthropicReq).input_tokens,
-                    output_tokens: Math.ceil(fullResponse.length / 3),
-                    total_tokens: estimateInputTokens(anthropicReq).input_tokens + Math.ceil(fullResponse.length / 3),
-                },
-            },
-        });
+          let fullResponse = '';
+          await sendCursorRequest(cursorReq, (event: CursorSSEEvent) => {
+              if (event.type === 'text-delta' && event.delta) fullResponse += event.delta;
+          });
 
-    } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(`[OpenAI] /v1/responses 流式处理失败:`, message);
-        // Still send response.completed so the client doesn't hang
-        writeResponsesSSE(res, 'response.failed', {
-            type: 'response.failed',
-            response: { id: responseId, object: 'realtime.response', model, status: 'failed', created_at: created, error: { message } },
-        });
-    }
+          const usageEst = estimateInputTokens(anthropicReq);
+          const outputTokens = Math.ceil(fullResponse.length / 3);
+          const { thinkingBlocks, cleanText: textAfterThinking } = extractThinking(fullResponse);
+          const thinking = thinkingBlocks.map(b => b.thinking).join('\n\n');
+          const responseText = thinking ? textAfterThinking : fullResponse;
+          const hasTools = (chatBody.tools?.length ?? 0) > 0;
+          const outputItems: Record<string, unknown>[] = [];
 
-    res.end();
-}
+          if (thinking) {
+              const rsId = 'rs_' + uuidv4().replace(/-/g, '').substring(0, 24);
+              const rsItem = { id: rsId, type: 'reasoning', summary: [{ type: 'summary_text', text:
+  thinking }], status: 'completed' };
+              writeResponsesSSE(res, 'response.output_item.added', { type: 'response.output_item.added',       
+  output_index: outputItems.length, item: rsItem });
+              writeResponsesSSE(res, 'response.output_item.done', { type: 'response.output_item.done',
+  output_index: outputItems.length, item: rsItem });
+              outputItems.push(rsItem);
+          }
+
+          if (hasTools && hasToolCalls(responseText)) {
+              const { toolCalls, cleanText } = parseToolCalls(responseText);
+              const cleanOutput = sanitizeResponse(isRefusal(cleanText) ? '' : cleanText);
+              if (cleanOutput) {
+                  const textItemId = 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
+                  const textItem = { id: textItemId, type: 'message', role: 'assistant', content: [{ type:     
+  'output_text', text: cleanOutput }], status: 'completed' };
+                  writeResponsesSSE(res, 'response.output_item.added', { type: 'response.output_item.added',   
+  output_index: outputItems.length, item: textItem });
+                  writeResponsesSSE(res, 'response.output_text.delta', { type: 'response.output_text.delta',   
+  item_id: textItemId, output_index: outputItems.length, content_index: 0, delta: cleanOutput });
+                  writeResponsesSSE(res, 'response.output_text.done', { type: 'response.output_text.done',     
+  item_id: textItemId, output_index: outputItems.length, content_index: 0, text: cleanOutput });
+                  writeResponsesSSE(res, 'response.output_item.done', { type: 'response.output_item.done',     
+  output_index: outputItems.length, item: textItem });
+                  outputItems.push(textItem);
+              }
+              for (const tc of toolCalls) {
+                  const callId = 'call_' + uuidv4().replace(/-/g, '').substring(0, 24);
+                  const argsStr = JSON.stringify(tc.arguments);
+                  const fnItem = { id: callId, type: 'function_call', call_id: callId, name: tc.name,
+  arguments: argsStr, status: 'completed' };
+                  const outputIndex = outputItems.length;
+                  writeResponsesSSE(res, 'response.output_item.added', { type: 'response.output_item.added',   
+  output_index: outputIndex, item: { ...fnItem, arguments: '' } });
+                  writeResponsesSSE(res, 'response.function_call_arguments.delta', { type:
+  'response.function_call_arguments.delta', item_id: callId, output_index: outputIndex, call_id: callId, delta:
+  argsStr });
+                  writeResponsesSSE(res, 'response.function_call_arguments.done', { type:
+  'response.function_call_arguments.done', item_id: callId, output_index: outputIndex, call_id: callId,        
+  arguments: argsStr });
+                  writeResponsesSSE(res, 'response.output_item.done', { type: 'response.output_item.done',     
+  output_index: outputIndex, item: fnItem });
+                  outputItems.push(fnItem);
+              }
+          } else {
+              const sanitized = sanitizeResponse(responseText);
+              const textItem = { id: itemId, type: 'message', role: 'assistant', content: [{ type:
+  'output_text', text: sanitized }], status: 'completed' };
+              writeResponsesSSE(res, 'response.output_item.added', { type: 'response.output_item.added',       
+  output_index: 0, item: { ...textItem, content: [{ type: 'output_text', text: '' }] } });
+              const CHUNK = 64;
+              for (let i = 0; i < sanitized.length; i += CHUNK) {
+                  writeResponsesSSE(res, 'response.output_text.delta', { type: 'response.output_text.delta',   
+  item_id: itemId, output_index: 0, content_index: 0, delta: sanitized.slice(i, i + CHUNK) });
+              }
+              writeResponsesSSE(res, 'response.output_text.done', { type: 'response.output_text.done', item_id:
+  itemId, output_index: 0, content_index: 0, text: sanitized });
+              writeResponsesSSE(res, 'response.output_item.done', { type: 'response.output_item.done',
+  output_index: 0, item: textItem });
+              outputItems.push(textItem);
+          }
+          writeResponsesSSE(res, 'response.completed', {
+              type: 'response.completed',
+              response: {
+                  id: responseId,
+                  object: 'response',
+                  model,
+                  status: 'completed',
+                  created_at: created,
+                  output: outputItems,
+                  usage: {
+                      input_tokens: usageEst.input_tokens,
+                      output_tokens: outputTokens,
+                      total_tokens: usageEst.input_tokens + outputTokens,
+                  },
+              },
+          });
+
+      } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(`[OpenAI] /v1/responses 流式处理失败:`, message);
+          writeResponsesSSE(res, 'response.failed', {
+              type: 'response.failed',
+              response: { id: responseId, object: 'response', model, status: 'failed', created_at: created,    
+  error: { message } },
+          });
+      }
+
+      res.end();
+  }
 
 /**
  * 将 OpenAI Responses API 格式转换为 Chat Completions 格式
  *
  * Responses API 使用 `input` 而非 `messages`，格式与 Chat Completions 不同
  */
-export function responsesToChatCompletions(body: Record<string, unknown>): OpenAIChatRequest {
-    const messages: OpenAIMessage[] = [];
+  export function responsesToChatCompletions(body: Record<string, unknown>): OpenAIChatRequest {
+      const messages: OpenAIMessage[] = [];
 
-    // 系统指令
-    if (body.instructions && typeof body.instructions === 'string') {
-        messages.push({ role: 'system', content: body.instructions });
-    }
+      if (body.instructions && typeof body.instructions === 'string') {
+          messages.push({ role: 'system', content: body.instructions });
+      }
 
-    // 转换 input
-    const input = body.input;
-    if (typeof input === 'string') {
-        messages.push({ role: 'user', content: input });
-    } else if (Array.isArray(input)) {
-        for (const item of input as Record<string, unknown>[]) {
-            // function_call_output 没有 role 字段，必须先检查 type
-            if (item.type === 'function_call_output') {
-                messages.push({
-                    role: 'tool',
-                    content: (item.output as string) || '',
-                    tool_call_id: (item.call_id as string) || '',
-                });
-                continue;
-            }
-            const role = (item.role as string) || 'user';
-            if (role === 'system' || role === 'developer') {
-                const text = typeof item.content === 'string'
-                    ? item.content
-                    : Array.isArray(item.content)
-                        ? (item.content as Array<Record<string, unknown>>).filter(b => b.type === 'input_text').map(b => b.text as string).join('\n')
-                        : String(item.content || '');
-                messages.push({ role: 'system', content: text });
-            } else if (role === 'user') {
-                const content = typeof item.content === 'string'
-                    ? item.content
-                    : Array.isArray(item.content)
-                        ? (item.content as Array<Record<string, unknown>>).filter(b => b.type === 'input_text').map(b => b.text as string).join('\n')
-                        : String(item.content || '');
-                messages.push({ role: 'user', content });
-            } else if (role === 'assistant') {
-                const blocks = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [];
-                const text = blocks.filter(b => b.type === 'output_text').map(b => b.text as string).join('\n');
-                // 检查是否有工具调用
-                const toolCallBlocks = blocks.filter(b => b.type === 'function_call');
-                const toolCalls: OpenAIToolCall[] = toolCallBlocks.map(b => ({
-                    id: (b.call_id as string) || toolCallId(),
-                    type: 'function' as const,
-                    function: {
-                        name: (b.name as string) || '',
-                        arguments: (b.arguments as string) || '{}',
-                    },
-                }));
-                messages.push({
-                    role: 'assistant',
-                    content: text || null,
-                    ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-                });
-            }
-        }
-    }
+      const input = body.input;
+      if (typeof input === 'string') {
+          messages.push({ role: 'user', content: input });
+      } else if (Array.isArray(input)) {
+         for (const item of input as Record<string, unknown>[]) {
+              if (item.type === 'function_call_output') {
+                  messages.push({
+                      role: 'tool',
+                      content: (item.output as string) || '',
+                      tool_call_id: (item.call_id as string) || '',
+                  });
+                  continue;
+              }
+              // function_call: assistant tool-call history in multi-turn conversations
+              if (item.type === 'function_call') {
+                  const tc: OpenAIToolCall = {
+                      id: (item.call_id as string) || toolCallId(),
+                      type: 'function',
+                      function: {
+                          name: (item.name as string) || '',
+                          arguments: (item.arguments as string) || '{}',
+                      },
+                  };
+                  const prev = messages[messages.length - 1];
+                  if (prev?.role === 'assistant') {
+                      (prev as OpenAIMessage).tool_calls = [...((prev as OpenAIMessage).tool_calls || []), tc];
+                  } else {
+                      messages.push({ role: 'assistant', content: null, tool_calls: [tc] });
+                  }
+                  continue;
+              }
+              const role = (item.role as string) || 'user';
+              if (role === 'system' || role === 'developer') {
+                  const text = typeof item.content === 'string'
+                      ? item.content
+                      : Array.isArray(item.content)
+                          ? (item.content as Array<Record<string, unknown>>).filter(b => b.type ===
+  'input_text').map(b => b.text as string).join('\n')
+                          : String(item.content || '');
+                  messages.push({ role: 'system', content: text });
+              } else if (role === 'user') {
+                  const content = typeof item.content === 'string'
+                      ? item.content
+                      : Array.isArray(item.content)
+                          ? (item.content as Array<Record<string, unknown>>).filter(b => b.type ===
+  'input_text').map(b => b.text as string).join('\n')
+                         : String(item.content || '');
+                  messages.push({ role: 'user', content });
+              } else if (role === 'assistant') {
+                  const blocks = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> :
+  [];
+                  const text = blocks.filter(b => b.type === 'output_text').map(b => b.text as
+  string).join('\n');
+                  const toolCallBlocks = blocks.filter(b => b.type === 'function_call');
+                  const toolCalls: OpenAIToolCall[] = toolCallBlocks.map(b => ({
+                      id: (b.call_id as string) || toolCallId(),
+                      type: 'function' as const,
+                      function: {
+                          name: (b.name as string) || '',
+                          arguments: (b.arguments as string) || '{}',
+                      },
+                  }));
+                  messages.push({
+                      role: 'assistant',
+                      content: text || null,
+                      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+                  });
+              }
+          }
+      }
 
-    // 转换工具定义
-    const tools: OpenAITool[] | undefined = Array.isArray(body.tools)
-        ? (body.tools as Array<Record<string, unknown>>).map(t => {
-            if (t.type === 'function') {
-                return {
-                    type: 'function' as const,
-                    function: {
-                        name: (t.name as string) || '',
-                        description: t.description as string | undefined,
-                        parameters: t.parameters as Record<string, unknown> | undefined,
-                    },
-                };
-            }
-            return {
-                type: 'function' as const,
-                function: {
-                    name: (t.name as string) || '',
-                    description: t.description as string | undefined,
-                    parameters: t.parameters as Record<string, unknown> | undefined,
-                },
-            };
-        })
-        : undefined;
+      // 过滤非 function 类型工具（web_search_preview、computer_use_preview 等）
+      const tools: OpenAITool[] | undefined = Array.isArray(body.tools)
+          ? (body.tools as Array<Record<string, unknown>>).filter(t => t.type === 'function').map(t => ({      
+              type: 'function' as const,
+              function: {
+                  name: (t.name as string) || '',
+                  description: t.description as string | undefined,
+                  parameters: t.parameters as Record<string, unknown> | undefined,
+              },
+          }))
+          : undefined;
 
-    return {
-        model: (body.model as string) || 'gpt-4',
-        messages,
-        stream: (body.stream as boolean) ?? true,
-        temperature: body.temperature as number | undefined,
-        max_tokens: (body.max_output_tokens as number) || 8192,
-        tools,
-    };
-}
+      return {
+          model: (body.model as string) || 'gpt-4',
+          messages,
+          stream: (body.stream as boolean) ?? true,
+          temperature: body.temperature as number | undefined,
+          max_tokens: (body.max_output_tokens as number) || 8192,
+          tools,
+      };
+  }
+
