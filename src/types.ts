@@ -114,6 +114,7 @@ export interface AppConfig {
     timeout: number;
     proxy?: string;
     cursorModel: string;
+    forceUseCursorModel?: boolean;
     enableThinking?: boolean;
     vision?: {
         enabled: boolean;

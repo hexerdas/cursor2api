@@ -127,10 +127,25 @@ export function listModels(_req: Request, res: Response): void {
         data: [
             { id: model, object: 'model', created: now, owned_by: 'anthropic' },
             // Cursor IDE 推荐使用以下 Claude 模型名（避免走 /v1/responses 格式）
+            { id: 'gpt-5.4', object: 'model', created: now, owned_by: 'OpenAI' },
+            { id: 'gpt-5.4-fast', object: 'model', created: now, owned_by: 'OpenAI' },
+            { id: 'gpt-5.4-long', object: 'model', created: now, owned_by: 'OpenAI' },
+            { id: 'gpt-5.3-codex', object: 'model', created: now, owned_by: 'OpenAI' },
+            { id: 'gpt-5.2-codex', object: 'model', created: now, owned_by: 'OpenAI' },
+            { id: 'gpt-5.1-codex', object: 'model', created: now, owned_by: 'OpenAI' },
+            { id: 'gpt-5.1-codex-mini', object: 'model', created: now, owned_by: 'OpenAI' },
+            { id: 'gemini-3.1-pro', object: 'model', created: now, owned_by: 'Google' },
+            { id: 'gemini-3-pro-image-preview', object: 'model', created: now, owned_by: 'Google' },
+            { id: 'gemini-3-flash', object: 'model', created: now, owned_by: 'Google' },
+            { id: 'claude-opus-4-6', object: 'model', created: now, owned_by: 'anthropic' },
+            { id: 'claude-opus-4-6-thinking', object: 'model', created: now, owned_by: 'anthropic' },
+            { id: 'claude-opus-4-6-long', object: 'model', created: now, owned_by: 'anthropic' },
+            { id: 'claude-sonnet-4-6', object: 'model', created: now, owned_by: 'anthropic' },
+            { id: 'claude-sonnet-4-6-thinking', object: 'model', created: now, owned_by: 'anthropic' },
+            { id: 'claude-sonnet-4-6-long', object: 'model', created: now, owned_by: 'anthropic' },
             { id: 'claude-sonnet-4-5-20250929', object: 'model', created: now, owned_by: 'anthropic' },
             { id: 'claude-sonnet-4-20250514', object: 'model', created: now, owned_by: 'anthropic' },
-            { id: 'claude-3-5-sonnet-20241022', object: 'model', created: now, owned_by: 'anthropic' },
-        ],
+            { id: 'claude-3-5-sonnet-20241022', object: 'model', created: now, owned_by: 'anthropic' },        ],
     });
 }
 

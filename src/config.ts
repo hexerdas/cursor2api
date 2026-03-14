@@ -1,11 +1,19 @@
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, watch } from 'fs';
 import { parse as parseYaml } from 'yaml';
 import type { AppConfig, VisionProvider } from './types.js';
 
-let config: AppConfig;
+let config: AppConfig | undefined;
+
+// 监听 config.yaml 变更，变更时清除缓存，下次请求自动重新加载
+if (existsSync('config.yaml')) {
+    watch('config.yaml', () => {
+        config = undefined;
+        console.log('[Config] config.yaml 已变更，下次请求将重新加载');
+    });
+}
 
 export function getConfig(): AppConfig {
-    if (config) return config;
+    if (config !== undefined) return config;
 
     // 默认配置
     config = {
@@ -27,6 +35,7 @@ export function getConfig(): AppConfig {
             if (yaml.timeout) config.timeout = yaml.timeout;
             if (yaml.proxy) config.proxy = yaml.proxy;
             if (yaml.cursor_model) config.cursorModel = yaml.cursor_model;
+            if (yaml.force_use_cursor_model !== undefined) config.forceUseCursorModel = yaml.force_use_cursor_model;
             if (yaml.enable_thinking !== undefined) config.enableThinking = yaml.enable_thinking;
             if (yaml.fingerprint) {
                 if (yaml.fingerprint.user_agent) config.fingerprint.userAgent = yaml.fingerprint.user_agent;

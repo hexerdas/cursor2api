@@ -20,6 +20,7 @@ import type {
     ParsedToolCall,
 } from './types.js';
 import { getConfig } from './config.js';
+import { pickBestModel } from './models.js';
 import { applyVisionInterceptor } from './vision.js';
 import { fixToolCallArguments } from './tool-fixer.js';
 import { THINKING_HINT } from './thinking.js';
@@ -339,8 +340,12 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         console.log(`[Converter] 当前对话上下文正常 (${totalChars} chars)，未达到 ${MAX_SAFE_CHARS} 的极限阈值，跳过全量强制压缩（保障复杂任务 Plan 上下文）。`);
     }
 
+    const resolvedModel = config.forceUseCursorModel
+        ? config.cursorModel
+        : pickBestModel(req.model || config.cursorModel, [config.cursorModel]);
+
     return {
-        model: config.cursorModel,
+        model: resolvedModel,
         id: shortId(),
         messages,
         trigger: 'submit-message',
